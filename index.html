@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SLA Analyzer Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; }
+    .container { max-width: 900px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+    h1 { text-align: center; color: #2c3e50; }
+    .upload-area { border: 3px dashed #3498db; padding: 40px; text-align: center; border-radius: 10px; margin: 20px 0; cursor: pointer; }
+    .upload-area:hover { background: #ecf0f1; }
+    .results { margin-top: 30px; display: none; }
+    .metric { background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; margin: 10px 0; font-size: 1.2em; }
+    .download-btn { background: #27ae60; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+    th { background: #f8f9fa; }
+    .loading { text-align: center; color: #7f8c8d; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>SLA Analyzer Dashboard</h1>
+    <p style="text-align:center; color:#7f8c8d;">Upload any Excel file with columns: <strong>Number, Created, Actual work end</strong></p>
+
+    <div class="upload-area" onclick="document.getElementById('file-input').click()">
+      <p><strong>Click or drop file here</strong><br><small>Any .xlsx file accepted</small></p>
+      <input type="file" id="file-input" accept=".xlsx" style="display:none" />
+    </div>
+
+    <div id="loading" class="loading" style="display:none;">Processing your file...</div>
+
+    <div id="results" class="results">
+      <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
+        <div class="metric">Within SLA: <strong id="within">0</strong></div>
+        <div class="metric">Past SLA: <strong id="past">0</strong></div>
+        <div class="metric">Avg Close: <strong id="avg">0</strong>h</div>
+        <div class="metric">Compliance: <strong id="comp">0%</strong></div>
+      </div>
+
+      <button class="download-btn" id="download-btn">Download Full Report (Excel)</button>
+
+      <h3 style="margin-top:30px;">Detailed Tickets</h3>
+      <div id="table-container"></div>
+    </div>
+  </div>
+
+  <script>
+    let pyodide;
+    async function main() {
+      pyodide = await loadPyodide();
+      await pyodide.loadPackage(["pandas", "openpyxl", "micropip"]);
+      await pyodide.runPythonAsync(`
+        import micropip
+        await micropip.install('xlrd')
+      `);
+    }
+    main();
+
+    document.getElementById("file-input").addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      document.getElementById("loading").style.display = "block";
+      document.getElementById("results").style.display = "none";
+
+      const arrayBuffer = await file.arrayBuffer();
+      const uint8 = new Uint8Array(arrayBuffer);
+
+      const result = await pyodide.runPythonAsync(`
+        import pandas as pd
+        from io import BytesIO
+        import base64
+
+        SLA_LIMIT = 24.0
+
+        # Read file
+        df = pd.read_excel(BytesIO(uint8))
+
+        # Find columns (case-insensitive, partial match)
+        cols = df.columns.str.lower()
+        num_col = df.columns[cols.str.contains('number')][0]
+        created_col = df.columns[cols.str.contains('created')][0]
+        end_col = df.columns[cols.str.contains('actual.*end|work.*end', regex=True)][0]
+
+        df = df[[num_col, created_col, end_col]].copy()
+        df.columns = ['Number', 'Created', 'Actual work end']
+
+        # Convert Excel serial
+        def to_dt(x):
+            try:
+                if x > 10000: return pd.to_datetime(x, unit='D', origin='1899-12-30')
+                return pd.to_datetime(x)
+            except:
+                return pd.NaT
+
+        df['Created'] = df['Created'].apply(to_dt)
+        df['Actual work end'] = df['Actual work end'].apply(to_dt)
+        df = df.dropna()
+
+        df['hours'] = (df['Actual work end'] - df['Created']).dt.total_seconds() / 3600
+        df['time'] = df['hours'] / 24
+        df['STATUS'] = df['hours'] > SLA_LIMIT
+
+        total = len(df)
+        within = len(df[~df['STATUS']])
+        past = len(df[df['STATUS']])
+        avg = df['hours'].mean()
+        comp = 1 - (past / total) if total > 0 else 0
+
+        # Summary rows
+        summary = [
+            ['', '', 'Ticket Within SLA', within, ''],
+            ['', '', 'Closed past SLA', past, ''],
+            ['', '', 'Ticket Close rate avrg', round(avg, 9), ''],
+            ['', '', 'Past SLA Percentage', round(past/total, 4), ''],
+            ['', '', 'SLA COMPLIANCE', round(comp, 4), '']
+        ]
+
+        # Write Excel
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df[['Number', 'Created', 'Actual work end', 'hours', 'STATUS', 'time']].to_excel(writer, 'Sheet1', index=False)
+            pd.DataFrame(summary).to_excel(writer, 'Sheet1', index=False, header=False, startrow=len(df)+2)
+            breakdown = pd.DataFrame({'Row Labels': ['True', 'False', 'Grand Total'], 'Count of sla': [past, within, total]})
+            breakdown.to_excel(writer, 'breakdown', index=False)
+        excel_b64 = base64.b64encode(output.getvalue()).decode()
+
+        # Return JSON
+        import json
+        json.dumps({
+            'within': within,
+            'past': past,
+            'avg': round(avg, 2),
+            'comp': round(comp * 100, 1),
+            'table': df[['Number', 'hours', 'STATUS']].to_html(index=False),
+            'excel': excel_b64
+        })
+      `);
+
+      const data = JSON.parse(result);
+      document.getElementById("loading").style.display = "none";
+      document.getElementById("results").style.display = "block";
+
+      document.getElementById("within").textContent = data.within;
+      document.getElementById("past").textContent = data.past;
+      document.getElementById("avg").textContent = data.avg;
+      document.getElementById("comp").textContent = data.comp + "%";
+      document.getElementById("table-container").innerHTML = data.table;
+
+      // Download
+      document.getElementById("download-btn").onclick = () => {
+        const link = document.createElement("a");
+        link.href = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + data.excel;
+        link.download = `SLA_Report_${new Date().toISOString().split('T')[0]}.xlsx`;
+        link.click();
+      };
+    });
+  </script>
+</body>
+</html>
