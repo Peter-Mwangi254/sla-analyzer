@@ -64,12 +64,3 @@ A **zero-setup web app** that:
 
 ## How It Works  
 
-```mermaid
-graph TD
-    A[Customer Raises Ticket] --> B[Engineer Assigned]
-    B --> C[Ticket Closed]
-    C --> D[Export to Excel]
-    D --> E[Upload to SLA Tracker]
-    E --> F[Auto-Analysis]
-    F --> G[Real-Time Dashboard + Report]
-    G --> H[HR & Management Act]
